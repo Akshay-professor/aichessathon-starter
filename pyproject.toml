@@ -34,4 +34,13 @@ ignore = ["N818"]
 
 [tool.mypy]
 strict = true
-files = ["agent.py", "harness"]
+files = ["agent.py", "bb_tables.py", "bb_board.py", "bb_movegen.py", "harness", "tools"]
+
+# numba ships no stubs, so its decorators erase the signatures they wrap.
+[[tool.mypy.overrides]]
+module = ["numba.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["bb_tables", "bb_board", "bb_movegen", "tools.*"]
+disallow_untyped_decorators = false
