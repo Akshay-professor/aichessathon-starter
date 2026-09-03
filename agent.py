@@ -21,6 +21,7 @@ import time
 from typing import Final
 
 import chess
+import numpy as np
 
 import bb_board
 import bb_search
@@ -585,6 +586,11 @@ def _think(board: chess.Board, budget: float) -> chess.Move | None:
 
 
 MAX_SEARCH_DEPTH: Final = 48
+# Inside this many plies of the 300-ply cap, the referee's material adjudication starts to
+# decide the game, so a draw stops being worth zero. See _contempt.
+ADJUDICATION_HORIZON: Final = 60
+ADJUDICATION_CONTEMPT: Final = 150
+MATERIAL_MARGIN: Final = 50
 FALLBACK_SHARE: Final = 0.10
 # An iteration started just under the budget can run several times as long as the one before
 # it, so new iterations stop early and the hard abort lands on the budget itself. Overshooting
@@ -593,7 +599,66 @@ SOFT_SHARE: Final = 0.45
 
 _STATE = bb_search.State()
 _POSITION = bb_board.Position()
-_GAME_KEYS_SEEN = 0
+_HISTORY_POSITION = bb_board.Position()
+
+# The FEN carries no history, but the referee claims threefold and fifty-move draws on the
+# whole game. We are only shown our own turns, so the positions in between are reconstructed
+# by replaying the one legal move that leads from our last position to the one we are handed.
+_GAME_BOARD: chess.Board | None = None
+_HISTORY_KEYS: list[int] = []
+
+
+def _position_key(board: chess.Board) -> int:
+    """The engine's own zobrist for an arbitrary board."""
+    bb_board.set_fen(_HISTORY_POSITION, board.fen())
+    return int(_HISTORY_POSITION.zkey[0])
+
+
+def _sync_history(board: chess.Board) -> None:
+    """Extend the recorded game with the opponent's reply, or start again if we lost track."""
+    global _GAME_BOARD
+    if _GAME_BOARD is not None:
+        target = board._transposition_key()
+        for move in _GAME_BOARD.legal_moves:
+            _GAME_BOARD.push(move)
+            if _GAME_BOARD._transposition_key() == target:
+                _HISTORY_KEYS.append(_position_key(_GAME_BOARD))
+                return
+            _GAME_BOARD.pop()
+    _GAME_BOARD = board.copy(stack=False)
+    _HISTORY_KEYS.clear()
+    _HISTORY_KEYS.append(_position_key(_GAME_BOARD))
+
+
+def _commit_move(move: chess.Move) -> None:
+    """Record the move we are about to play, so the next call can extend from it."""
+    if _GAME_BOARD is not None and _GAME_BOARD.is_legal(move):
+        _GAME_BOARD.push(move)
+        _HISTORY_KEYS.append(_position_key(_GAME_BOARD))
+
+
+def _contempt(board: chess.Board, plies_played: int) -> int:
+    """What a draw is worth to us, in centipawns, from our own point of view.
+
+    Normally zero. Near the ply cap it is not: the referee adjudicates 300 plies on material
+    alone, so if we are ahead a repetition throws away a win the referee would have given us,
+    and if we are behind a repetition rescues half a point from a loss. The evaluation cannot
+    see this, because nothing in the position says the game is about to be scored on material.
+    """
+    if PLY_CAP - plies_played > ADJUDICATION_HORIZON:
+        return 0
+    balance = 0
+    for piece, value in MVV_LVA_VICTIM.items():
+        if piece == chess.KING:
+            continue
+        balance += value * (
+            len(board.pieces(piece, board.turn)) - len(board.pieces(piece, not board.turn))
+        )
+    if balance > MATERIAL_MARGIN:
+        return -ADJUDICATION_CONTEMPT
+    if balance < -MATERIAL_MARGIN:
+        return ADJUDICATION_CONTEMPT
+    return 0
 
 
 def _raise_flag(control: "object", index: int) -> None:
@@ -607,17 +672,15 @@ def _engine_move(fen: str, budget_ms: float, time_left_ms: int) -> str | None:
     threads keep running while it executes: one asks it to stop starting new iterations, the
     other aborts it outright. That is the same mechanism a ponder thread will use.
     """
-    global _GAME_KEYS_SEEN
-
     bb_board.set_fen(_POSITION, fen)
     _STATE.bb[0] = _POSITION.bb[0]
     _STATE.mailbox[0] = _POSITION.mailbox[0]
     _STATE.meta[0] = _POSITION.meta[0]
     _STATE.zkey[0] = _POSITION.zkey[0]
 
-    if _GAME_KEYS_SEEN < bb_search.MAX_GAME_KEYS:
-        _STATE.game_keys[_GAME_KEYS_SEEN] = _POSITION.zkey[0]
-        _GAME_KEYS_SEEN += 1
+    recorded = _HISTORY_KEYS[-bb_search.MAX_GAME_KEYS :]
+    for index, key in enumerate(recorded):
+        _STATE.game_keys[index] = np.uint64(key)
 
     control = _STATE.control
     control[bb_search.STOP] = 0
@@ -634,7 +697,7 @@ def _engine_move(fen: str, budget_ms: float, time_left_ms: int) -> str | None:
     soft.start()
     hard.start()
     try:
-        _STATE.run(MAX_SEARCH_DEPTH, _GAME_KEYS_SEEN)
+        _STATE.run(MAX_SEARCH_DEPTH, len(recorded))
     finally:
         soft.cancel()
         hard.cancel()
@@ -660,8 +723,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
     one bad move rather than the point. Three layers, in order: the jitted engine, the
     python-chess reference search, then any legal move.
     """
-    global _CALLS
-
     try:
         board = chess.Board(fen)
         fallback = _fallback_move(board)
@@ -669,32 +730,52 @@ def get_move(fen: str, time_left_ms: int) -> str:
         print(f"cannot read {fen!r}: {error!r}")
         return "0000"
 
-    _CALLS += 1
-    budget = _budget_ms(time_left_ms, (_CALLS - 1) * 2)
+    try:
+        _sync_history(board)
+        plies_played = len(_HISTORY_KEYS) - 1
+        _STATE.control[bb_search.CONTEMPT] = _contempt(board, plies_played)
+    except Exception as error:  # history is an optimisation; never let it end the game
+        print(f"history tracking failed: {error!r}")
+        plies_played = 0
+
+    budget = _budget_ms(time_left_ms, plies_played)
+    chosen: chess.Move | None = None
 
     try:
         uci = _engine_move(fen, budget, time_left_ms)
-        if uci is not None and board.is_legal(chess.Move.from_uci(uci)):
-            return uci
-        print(f"engine returned {uci!r}; falling back")
+        if uci is not None:
+            candidate = chess.Move.from_uci(uci)
+            if board.is_legal(candidate):
+                chosen = candidate
+            else:
+                print(f"engine returned illegal {uci!r}; falling back")
     except Exception as error:
         print(f"engine failed, falling back: {error!r}")
 
-    # The engine has already spent its budget, so the fallback gets a small slice of what is
-    # left. A worse move is survivable; a flag is not.
-    try:
-        spare = max(0.0, time_left_ms - RESERVE_MS) * FALLBACK_SHARE
-        move = _think(board, spare)
-        if move is not None and board.is_legal(move):
-            return move.uci()
-    except Exception as error:
-        print(f"fallback search failed: {error!r}")
+    if chosen is None:
+        # The engine has already spent its budget, so the fallback gets a small slice of what
+        # is left. A worse move is survivable; a flag is not.
+        try:
+            spare = max(0.0, time_left_ms - RESERVE_MS) * FALLBACK_SHARE
+            move = _think(board, spare)
+            if move is not None and board.is_legal(move):
+                chosen = move
+        except Exception as error:
+            print(f"fallback search failed: {error!r}")
 
-    return fallback.uci()
+    if chosen is None:
+        chosen = fallback
+
+    try:
+        _commit_move(chosen)
+    except Exception as error:
+        print(f"could not record {chosen.uci()}: {error!r}")
+    return chosen.uci()
 
 
 # Compile every jitted signature and touch the search tables now, inside the 60s init budget.
 # Work deferred to the first get_move would come out of the match clock instead.
+_HISTORY_KEYS.append(_position_key(chess.Board()))
 _engine_move(chess.STARTING_FEN, 40.0, 120_000)
-_GAME_KEYS_SEEN = 0
-_CALLS = 0
+_HISTORY_KEYS.clear()
+_GAME_BOARD = None

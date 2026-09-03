@@ -52,6 +52,7 @@ NODES = 2
 BEST_MOVE = 3
 BEST_SCORE = 4
 COMPLETED_DEPTH = 5
+CONTEMPT = 6
 CONTROL_FIELDS = 8
 
 CHECK_INTERVAL = 2048
@@ -129,19 +130,19 @@ def _repeated(
         return False
     key = zkey[ply]
     back = 2
-    index = ply - 2
-    while index >= 0 and back <= halfmove:
-        if zkey[index] == key:
-            return True
-        index -= 2
-        back += 2
-    # game_keys carries one entry per position we were asked about, so consecutive entries
-    # are already two plies apart: step by one here, but keep counting plies in twos.
-    index = game_count - 2
-    while index >= 0 and back <= halfmove:
-        if game_keys[index] == key:
-            return True
-        index -= 1
+    while back <= halfmove:
+        index = ply - back
+        if index >= 0:
+            if zkey[index] == key:
+                return True
+        else:
+            # game_keys holds every position of the game in order, ending at the root, so an
+            # ancestor below the search stack sits at (game_count - 1) + (ply - back).
+            game_index = game_count - 1 + index
+            if game_index < 0:
+                return False
+            if game_keys[game_index] == key:
+                return True
         back += 2
     return False
 
@@ -278,13 +279,16 @@ def negamax(
     is_pv = beta - alpha > 1
     us = meta[ply, META_SIDE]
 
+    contempt = int(control[CONTEMPT])
+    draw_score = contempt if (ply & 1) == 0 else -contempt
+
     if ply > 0:
         if meta[ply, META_HALFMOVE] >= 100:
-            return 0
+            return draw_score
         if _repeated(bb, mailbox, meta, zkey, moves, scores, killers, history,
                      tt_key, tt_move, tt_score, tt_depth, tt_flag, game_keys, control,
                      ply, game_count):
-            return 0
+            return draw_score
         if alpha < -MATE + ply:
             alpha = -MATE + ply
         if beta > MATE - ply - 1:
@@ -355,7 +359,7 @@ def negamax(
 
     count = generate_legal(bb, mailbox, meta, zkey, ply, moves[ply])
     if count == 0:
-        return -MATE + ply if checked else 0
+        return -MATE + ply if checked else draw_score
 
     _score_moves(bb, mailbox, meta, zkey, moves, scores, killers, history,
                  tt_key, tt_move, tt_score, tt_depth, tt_flag, game_keys, control,
