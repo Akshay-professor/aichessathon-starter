@@ -16,11 +16,14 @@ The structure that matters and will survive every later phase:
   itself, so an agent that does not track repetitions can draw a won game without being told.
 """
 
+import threading
 import time
 from typing import Final
 
 import chess
-import chess.polyglot
+
+import bb_board
+import bb_search
 
 PLY_CAP: Final = 300
 INCREMENT_MS: Final = 500.0
@@ -536,12 +539,8 @@ def _fallback_move(board: chess.Board) -> chess.Move:
     return best
 
 
-def _think(board: chess.Board, time_left_ms: int) -> chess.Move | None:
-    global _CALLS
-    _CALLS += 1
-    plies_played = (_CALLS - 1) * 2
-
-    budget = _budget_ms(time_left_ms, plies_played)
+def _think(board: chess.Board, budget: float) -> chess.Move | None:
+    """The reference python-chess search, kept as the fallback when the engine cannot answer."""
     started = time.monotonic()
     deadline = started + budget / 1000.0
 
@@ -579,31 +578,123 @@ def _think(board: chess.Board, time_left_ms: int) -> chess.Move | None:
 
     elapsed = (time.monotonic() - started) * 1000.0
     print(
-        f"ply~{plies_played} depth {depth} score {best_score} "
+        f"fallback depth {depth} score {best_score} "
         f"nodes {searcher.nodes} {elapsed:.0f}ms/{budget:.0f}ms"
     )
     return best
 
 
+MAX_SEARCH_DEPTH: Final = 48
+FALLBACK_SHARE: Final = 0.10
+# An iteration started just under the budget can run several times as long as the one before
+# it, so new iterations stop early and the hard abort lands on the budget itself. Overshooting
+# the budget is how agents flag, and a flag is a loss.
+SOFT_SHARE: Final = 0.45
+
+_STATE = bb_search.State()
+_POSITION = bb_board.Position()
+_GAME_KEYS_SEEN = 0
+
+
+def _raise_flag(control: "object", index: int) -> None:
+    control[index] = 1  # type: ignore[index]
+
+
+def _engine_move(fen: str, budget_ms: float, time_left_ms: int) -> str | None:
+    """Search with the jitted engine and return its move in UCI, or None if it produced none.
+
+    The clock is enforced from outside. `bb_search.search` is compiled nogil, so these timer
+    threads keep running while it executes: one asks it to stop starting new iterations, the
+    other aborts it outright. That is the same mechanism a ponder thread will use.
+    """
+    global _GAME_KEYS_SEEN
+
+    bb_board.set_fen(_POSITION, fen)
+    _STATE.bb[0] = _POSITION.bb[0]
+    _STATE.mailbox[0] = _POSITION.mailbox[0]
+    _STATE.meta[0] = _POSITION.meta[0]
+    _STATE.zkey[0] = _POSITION.zkey[0]
+
+    if _GAME_KEYS_SEEN < bb_search.MAX_GAME_KEYS:
+        _STATE.game_keys[_GAME_KEYS_SEEN] = _POSITION.zkey[0]
+        _GAME_KEYS_SEEN += 1
+
+    control = _STATE.control
+    control[bb_search.STOP] = 0
+    control[bb_search.SOFT_STOP] = 0
+    control[bb_search.BEST_MOVE] = 0
+
+    soft_ms = budget_ms * SOFT_SHARE
+    soft = threading.Timer(soft_ms / 1000.0, _raise_flag, (control, bb_search.SOFT_STOP))
+    hard = threading.Timer(budget_ms / 1000.0, _raise_flag, (control, bb_search.STOP))
+    soft.daemon = True
+    hard.daemon = True
+
+    started = time.monotonic()
+    soft.start()
+    hard.start()
+    try:
+        _STATE.run(MAX_SEARCH_DEPTH, _GAME_KEYS_SEEN)
+    finally:
+        soft.cancel()
+        hard.cancel()
+
+    elapsed = (time.monotonic() - started) * 1000.0
+    nodes = int(control[bb_search.NODES])
+    rate = nodes / elapsed if elapsed > 0 else 0.0
+    print(
+        f"depth {int(control[bb_search.COMPLETED_DEPTH])} "
+        f"score {int(control[bb_search.BEST_SCORE])} nodes {nodes} "
+        f"{elapsed:.0f}ms/{budget_ms:.0f}ms {rate:.0f}knps"
+    )
+
+    move = int(control[bb_search.BEST_MOVE])
+    return bb_board.move_uci(move) if move != 0 else None
+
+
 def get_move(fen: str, time_left_ms: int) -> str:
     """Return a legal move in UCI notation.
 
-    This never raises and never returns a move that is not legal in `fen`. Every failure the
-    platform recognises loses the game, so a bug in the search has to cost one bad move rather
-    than the point.
+    This never raises and never returns a move that is not legal in `fen`. Illegal moves,
+    crashes and flag falls each lose the game outright, so a defect anywhere below has to cost
+    one bad move rather than the point. Three layers, in order: the jitted engine, the
+    python-chess reference search, then any legal move.
     """
+    global _CALLS
+
     try:
         board = chess.Board(fen)
         fallback = _fallback_move(board)
     except (ValueError, IndexError) as error:
         print(f"cannot read {fen!r}: {error!r}")
         return "0000"
+
+    _CALLS += 1
+    budget = _budget_ms(time_left_ms, (_CALLS - 1) * 2)
+
     try:
-        move = _think(board, time_left_ms)
-    except Exception as error:  # the search is never allowed to end the game
-        print(f"search failed, falling back: {error!r}")
-        return fallback.uci()
-    if move is not None and board.is_legal(move):
-        return move.uci()
-    print(f"search returned {move!r}, falling back")
+        uci = _engine_move(fen, budget, time_left_ms)
+        if uci is not None and board.is_legal(chess.Move.from_uci(uci)):
+            return uci
+        print(f"engine returned {uci!r}; falling back")
+    except Exception as error:
+        print(f"engine failed, falling back: {error!r}")
+
+    # The engine has already spent its budget, so the fallback gets a small slice of what is
+    # left. A worse move is survivable; a flag is not.
+    try:
+        spare = max(0.0, time_left_ms - RESERVE_MS) * FALLBACK_SHARE
+        move = _think(board, spare)
+        if move is not None and board.is_legal(move):
+            return move.uci()
+    except Exception as error:
+        print(f"fallback search failed: {error!r}")
+
     return fallback.uci()
+
+
+# Compile every jitted signature and touch the search tables now, inside the 60s init budget.
+# Work deferred to the first get_move would come out of the match clock instead.
+_engine_move(chess.STARTING_FEN, 40.0, 120_000)
+_GAME_KEYS_SEEN = 0
+_CALLS = 0
