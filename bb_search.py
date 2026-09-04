@@ -80,9 +80,14 @@ ARRAYS = (
 
 
 class State:
-    """Every buffer the search writes. Allocated once; the jitted code mutates it in place."""
+    """Every buffer the search writes. Allocated once; the jitted code mutates it in place.
 
-    def __init__(self) -> None:
+    A ponder search gets its own State so it can never touch the position stack a real search
+    is walking, but shares the transposition table on purpose: the whole point of thinking on
+    the opponent's clock is that the work is still there when they finally move.
+    """
+
+    def __init__(self, share_table_with: "State | None" = None) -> None:
         self.bb: NDArray[np.uint64] = np.zeros((MAX_PLY, 8), dtype=U64)
         self.mailbox: NDArray[np.int8] = np.zeros((MAX_PLY, 64), dtype=np.int8)
         self.meta: NDArray[np.int64] = np.zeros((MAX_PLY, 4), dtype=np.int64)
@@ -91,11 +96,18 @@ class State:
         self.scores: NDArray[np.int64] = np.zeros((MAX_PLY, MAX_MOVES), dtype=np.int64)
         self.killers: NDArray[np.int32] = np.zeros((MAX_PLY, 2), dtype=np.int32)
         self.history: NDArray[np.int64] = np.zeros((2, 64, 64), dtype=np.int64)
-        self.tt_key: NDArray[np.uint64] = np.zeros(TT_SIZE, dtype=U64)
-        self.tt_move: NDArray[np.int32] = np.zeros(TT_SIZE, dtype=np.int32)
-        self.tt_score: NDArray[np.int64] = np.zeros(TT_SIZE, dtype=np.int64)
-        self.tt_depth: NDArray[np.int8] = np.zeros(TT_SIZE, dtype=np.int8)
-        self.tt_flag: NDArray[np.int8] = np.zeros(TT_SIZE, dtype=np.int8)
+        if share_table_with is None:
+            self.tt_key: NDArray[np.uint64] = np.zeros(TT_SIZE, dtype=U64)
+            self.tt_move: NDArray[np.int32] = np.zeros(TT_SIZE, dtype=np.int32)
+            self.tt_score: NDArray[np.int64] = np.zeros(TT_SIZE, dtype=np.int64)
+            self.tt_depth: NDArray[np.int8] = np.zeros(TT_SIZE, dtype=np.int8)
+            self.tt_flag: NDArray[np.int8] = np.zeros(TT_SIZE, dtype=np.int8)
+        else:
+            self.tt_key = share_table_with.tt_key
+            self.tt_move = share_table_with.tt_move
+            self.tt_score = share_table_with.tt_score
+            self.tt_depth = share_table_with.tt_depth
+            self.tt_flag = share_table_with.tt_flag
         self.game_keys: NDArray[np.uint64] = np.zeros(MAX_GAME_KEYS, dtype=U64)
         self.control: NDArray[np.int64] = np.zeros(CONTROL_FIELDS, dtype=np.int64)
 
