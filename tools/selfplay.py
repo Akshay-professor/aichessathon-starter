@@ -17,10 +17,9 @@ import time
 from pathlib import Path
 
 import chess
-import numpy as np
 
 from bb_board import Position, set_fen
-from bb_search import COMPLETED_DEPTH, State
+from bb_search import State
 from harness.rules import PLY_CAP
 
 PIECE_VALUES = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
@@ -46,7 +45,9 @@ def _adjudicate(board: chess.Board) -> str:
     return "1/2-1/2"
 
 
-def _play(state: State, position: Position, depth: int, rng: random.Random) -> tuple[str, list[str]]:
+def _play(
+    state: State, position: Position, depth: int, rng: random.Random
+) -> tuple[str, list[str]]:
     board = chess.Board()
     for _ in range(OPENING_PLIES):
         moves = list(board.legal_moves)

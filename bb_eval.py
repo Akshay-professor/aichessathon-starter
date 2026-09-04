@@ -7,6 +7,8 @@ to measure a tuned or learned replacement against. Phase 4 replaces the numbers,
 the weights live in arrays so a Texel run can overwrite them without touching the search.
 """
 
+from pathlib import Path
+
 import numpy as np
 from numba import njit
 from numpy.typing import NDArray
@@ -38,15 +40,23 @@ TOTAL_PHASE = 24
 MOBILITY_MG = np.array([0, 0, 4, 5, 2, 1, 0], dtype=np.int32)
 MOBILITY_EG = np.array([0, 0, 4, 5, 4, 2, 0], dtype=np.int32)
 
-BISHOP_PAIR = 30
-DOUBLED_PAWN = -12
-ISOLATED_PAWN = -14
-ROOK_OPEN_FILE = 22
-ROOK_SEMI_OPEN_FILE = 10
-SHIELD_PAWN = 11
+# Scalar terms, indexed by the constants below. Every one has a separate middlegame and
+# endgame weight even where the two currently agree, so tuning can move them apart.
+BISHOP_PAIR = 0
+DOUBLED_PAWN = 1
+ISOLATED_PAWN = 2
+ROOK_OPEN_FILE = 3
+ROOK_SEMI_OPEN_FILE = 4
+SHIELD_PAWN = 5
+SCALAR_COUNT = 6
+
+SCALAR_MG = np.array([30, -12, -14, 22, 10, 11], dtype=np.int32)
+SCALAR_EG = np.array([30, -12, -14, 0, 0, 0], dtype=np.int32)
+
 TEMPO = 12
 
-PASSED_BY_RANK = np.array([0, 6, 12, 24, 44, 76, 120, 0], dtype=np.int32)
+PASSED_MG = np.array([0, 3, 6, 12, 22, 38, 60, 0], dtype=np.int32)
+PASSED_EG = np.array([0, 6, 12, 24, 44, 76, 120, 0], dtype=np.int32)
 
 # Tables read a8 first, so a white piece on square s indexes at s ^ 56 and a black piece at s.
 # fmt: off
@@ -187,6 +197,31 @@ for _color in (WHITE, BLACK):
         SHIELD_ZONE[_color][_sq] = _files & _zone
 
 
+def _load_tuned_weights() -> bool:
+    """Overwrite the default numbers from weights/eval.npz, if it shipped with us.
+
+    This has to run before the evaluation below is decorated: numba captures the arrays it
+    reads as compile-time constants, so a load after that point would be silently ignored.
+    """
+    path = Path(__file__).resolve().parent / "weights" / "eval.npz"
+    if not path.exists():
+        return False
+    with np.load(path) as stored:
+        for name, table in (
+            ("piece_mg", PIECE_MG), ("piece_eg", PIECE_EG),
+            ("pst_mg", PST_MG), ("pst_eg", PST_EG),
+            ("mobility_mg", MOBILITY_MG), ("mobility_eg", MOBILITY_EG),
+            ("scalar_mg", SCALAR_MG), ("scalar_eg", SCALAR_EG),
+            ("passed_mg", PASSED_MG), ("passed_eg", PASSED_EG),
+        ):
+            if name in stored:
+                table[...] = stored[name]
+    return True
+
+
+TUNED = _load_tuned_weights()
+
+
 @njit("int64(uint64[:, :], int64[:, :], int64)", cache=False)
 def evaluate(bb: NDArray[np.uint64], meta: NDArray[np.int64], ply: int) -> int:
     """Static score in centipawns, positive for the side to move."""
@@ -230,32 +265,34 @@ def evaluate(bb: NDArray[np.uint64], meta: NDArray[np.int64], ply: int) -> int:
                 if piece == ROOK:
                     file_mask = FILE_BB[square & 7]
                     if (own_pawns | enemy_pawns) & file_mask == ZERO:
-                        middlegame += sign * ROOK_OPEN_FILE
+                        middlegame += sign * SCALAR_MG[ROOK_OPEN_FILE]
+                        endgame += sign * SCALAR_EG[ROOK_OPEN_FILE]
                     elif own_pawns & file_mask == ZERO:
-                        middlegame += sign * ROOK_SEMI_OPEN_FILE
+                        middlegame += sign * SCALAR_MG[ROOK_SEMI_OPEN_FILE]
+                        endgame += sign * SCALAR_EG[ROOK_SEMI_OPEN_FILE]
 
                 elif piece == PAWN:
                     file_index = square & 7
                     if popcount(own_pawns & FILE_BB[file_index]) > 1:
-                        middlegame += sign * DOUBLED_PAWN
-                        endgame += sign * DOUBLED_PAWN
+                        middlegame += sign * SCALAR_MG[DOUBLED_PAWN]
+                        endgame += sign * SCALAR_EG[DOUBLED_PAWN]
                     if own_pawns & ADJACENT_FILES[file_index] == ZERO:
-                        middlegame += sign * ISOLATED_PAWN
-                        endgame += sign * ISOLATED_PAWN
+                        middlegame += sign * SCALAR_MG[ISOLATED_PAWN]
+                        endgame += sign * SCALAR_EG[ISOLATED_PAWN]
                     if enemy_pawns & PASSED_MASK[color][square] == ZERO:
                         rank = square >> 3
                         relative = rank if color == WHITE else 7 - rank
-                        bonus = PASSED_BY_RANK[relative]
-                        middlegame += sign * (bonus // 2)
-                        endgame += sign * bonus
+                        middlegame += sign * PASSED_MG[relative]
+                        endgame += sign * PASSED_EG[relative]
 
                 elif piece == KING:
                     shelter = popcount(own_pawns & SHIELD_ZONE[color][square])
-                    middlegame += sign * SHIELD_PAWN * shelter
+                    middlegame += sign * SCALAR_MG[SHIELD_PAWN] * shelter
+                    endgame += sign * SCALAR_EG[SHIELD_PAWN] * shelter
 
         if popcount(bb[ply, 1 + BISHOP] & mine) >= 2:
-            middlegame += sign * BISHOP_PAIR
-            endgame += sign * BISHOP_PAIR
+            middlegame += sign * SCALAR_MG[BISHOP_PAIR]
+            endgame += sign * SCALAR_EG[BISHOP_PAIR]
 
     if phase > TOTAL_PHASE:
         phase = TOTAL_PHASE
