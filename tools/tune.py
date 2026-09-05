@@ -232,31 +232,28 @@ def load_dataset(path: Path, limit: int) -> tuple[NDArray[np.int16], NDArray[np.
                                                   NDArray[np.float32], NDArray[np.float32]]:
     """Read 'fen result' lines into features, phase, side-to-move sign and result."""
     position = Position()
-    scratch = np.zeros(FEATURE_COUNT, dtype=np.int16)
 
-    rows: list[NDArray[np.int16]] = []
-    phases: list[float] = []
-    stm: list[float] = []
-    results: list[float] = []
+    # A million rows of 476 int16 is nearly a gigabyte, so it is filled in place rather than
+    # accumulated in a list and copied.
+    with path.open() as handle:
+        total = min(sum(1 for _ in handle), limit)
+
+    rows = np.zeros((total, FEATURE_COUNT), dtype=np.int16)
+    phases = np.zeros(total, dtype=np.float32)
+    stm = np.zeros(total, dtype=np.float32)
+    results = np.zeros(total, dtype=np.float32)
 
     with path.open() as handle:
         for count, line in enumerate(handle):
-            if count >= limit:
+            if count >= total:
                 break
             fen, _, label = line.rpartition(" ")
             set_fen(position, fen)
-            phase = extract(position.bb, 0, scratch)
-            rows.append(scratch.copy())
-            phases.append(phase / TOTAL_PHASE)
-            stm.append(1.0 if fen.split()[1] == "w" else -1.0)
-            results.append(float(label))
+            phases[count] = extract(position.bb, 0, rows[count]) / TOTAL_PHASE
+            stm[count] = 1.0 if fen.split()[1] == "w" else -1.0
+            results[count] = float(label)
 
-    return (
-        np.array(rows, dtype=np.int16),
-        np.array(phases, dtype=np.float32),
-        np.array(stm, dtype=np.float32),
-        np.array(results, dtype=np.float32),
-    )
+    return rows, phases, stm, results
 
 
 def _scores(
