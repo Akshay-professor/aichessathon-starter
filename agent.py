@@ -596,15 +596,10 @@ FALLBACK_SHARE: Final = 0.10
 # it, so new iterations stop early and the hard abort lands on the budget itself. Overshooting
 # the budget is how agents flag, and a flag is a loss.
 SOFT_SHARE: Final = 0.45
-# The ponder search polls its stop flag every few thousand nodes, so this is generous.
-PONDER_JOIN_S: Final = 0.5
 
 _STATE = bb_search.State()
-_PONDER_STATE = bb_search.State(share_table_with=_STATE)
 _POSITION = bb_board.Position()
-_PONDER_POSITION = bb_board.Position()
 _HISTORY_POSITION = bb_board.Position()
-_PONDER_THREAD: threading.Thread | None = None
 
 # The FEN carries no history, but the referee claims threefold and fifty-move draws on the
 # whole game. We are only shown our own turns, so the positions in between are reconstructed
@@ -675,7 +670,7 @@ def _engine_move(fen: str, budget_ms: float, time_left_ms: int) -> str | None:
 
     The clock is enforced from outside. `bb_search.search` is compiled nogil, so these timer
     threads keep running while it executes: one asks it to stop starting new iterations, the
-    other aborts it outright. That is the same mechanism a ponder thread will use.
+    other aborts it outright.
     """
     bb_board.set_fen(_POSITION, fen)
     _STATE.bb[0] = _POSITION.bb[0]
@@ -720,56 +715,6 @@ def _engine_move(fen: str, budget_ms: float, time_left_ms: int) -> str | None:
     return bb_board.move_uci(move) if move != 0 else None
 
 
-def _stop_pondering() -> None:
-    """Halt the ponder search and wait for it, before anything else touches shared state."""
-    global _PONDER_THREAD
-    if _PONDER_THREAD is None:
-        return
-    _PONDER_STATE.control[bb_search.STOP] = 1
-    _PONDER_THREAD.join(timeout=PONDER_JOIN_S)
-    if _PONDER_THREAD.is_alive():
-        # It polls the stop flag every few thousand nodes, so this should be unreachable.
-        # If it ever happens, the table it shares is self-validating by key, and we would
-        # rather play on than block the clock.
-        print("ponder thread did not stop in time")
-    _PONDER_THREAD = None
-
-
-def _start_pondering(board: chess.Board) -> None:
-    """Search the position we just moved into, while the opponent burns their own clock.
-
-    The contract allows this outright: the process keeps its dedicated core after get_move
-    returns. We do not try to guess their reply. Searching the position with them to move
-    fills the shared table for every reply they might choose, so whatever they actually play,
-    the next search starts with the subtree beneath it already explored. A wrong guess would
-    waste the whole effort; this way nothing is wasted.
-    """
-    global _PONDER_THREAD
-    if board.is_game_over():
-        return
-
-    bb_board.set_fen(_PONDER_POSITION, board.fen())
-    _PONDER_STATE.bb[0] = _PONDER_POSITION.bb[0]
-    _PONDER_STATE.mailbox[0] = _PONDER_POSITION.mailbox[0]
-    _PONDER_STATE.meta[0] = _PONDER_POSITION.meta[0]
-    _PONDER_STATE.zkey[0] = _PONDER_POSITION.zkey[0]
-
-    recorded = _HISTORY_KEYS[-bb_search.MAX_GAME_KEYS :]
-    for index, key in enumerate(recorded):
-        _PONDER_STATE.game_keys[index] = np.uint64(key)
-
-    control = _PONDER_STATE.control
-    control[bb_search.STOP] = 0
-    control[bb_search.SOFT_STOP] = 0
-    control[bb_search.BEST_MOVE] = 0
-    control[bb_search.CONTEMPT] = -_STATE.control[bb_search.CONTEMPT]
-
-    _PONDER_THREAD = threading.Thread(
-        target=_PONDER_STATE.run, args=(MAX_SEARCH_DEPTH, len(recorded)), daemon=True
-    )
-    _PONDER_THREAD.start()
-
-
 def get_move(fen: str, time_left_ms: int) -> str:
     """Return a legal move in UCI notation.
 
@@ -778,8 +723,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
     one bad move rather than the point. Three layers, in order: the jitted engine, the
     python-chess reference search, then any legal move.
     """
-    _stop_pondering()
-
     try:
         board = chess.Board(fen)
         fallback = _fallback_move(board)
@@ -828,12 +771,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
     except Exception as error:
         print(f"could not record {chosen.uci()}: {error!r}")
 
-    try:
-        board.push(chosen)
-        _start_pondering(board)
-    except Exception as error:
-        print(f"could not start pondering: {error!r}")
-
     return chosen.uci()
 
 
@@ -841,7 +778,5 @@ def get_move(fen: str, time_left_ms: int) -> str:
 # Work deferred to the first get_move would come out of the match clock instead.
 _HISTORY_KEYS.append(_position_key(chess.Board()))
 _engine_move(chess.STARTING_FEN, 40.0, 120_000)
-_start_pondering(chess.Board())
-_stop_pondering()
 _HISTORY_KEYS.clear()
 _GAME_BOARD = None

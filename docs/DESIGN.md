@@ -21,7 +21,7 @@ improvement recovers six plies, so the node rate is where the effort went.
 
 | File | What it holds |
 |---|---|
-| `agent.py` | the entrypoint: time management, game history, pondering, and the fallbacks |
+| `agent.py` | the entrypoint: time management, game history, and the fallbacks |
 | `bb_tables.py` | attack tables, zobrist keys, sliding-attack kernels |
 | `bb_board.py` | position arrays, FEN, incremental zobrist, copy-make |
 | `bb_movegen.py` | pseudo-legal generation and the legality filter |
@@ -65,10 +65,17 @@ plies of the cap a draw stops being worth zero: ahead on material it is worth -1
 repetition throws away a win the referee would hand us; behind, it is worth +150, because a
 repetition rescues half a point from a loss.
 
-**The opponent's clock.** The process keeps its core after `get_move` returns, and pondering is
-allowed. The ponder search runs on the position we just moved into, with the opponent to move,
-filling a shared transposition table for every reply they might choose rather than betting on
-one prediction. Measured at 36% of our own clock returned at equal depth.
+**The opponent's clock — a thing we tried and the platform refused.** The agent contract states
+that the process keeps its dedicated core after `get_move` returns and that pondering is
+allowed. We built it: a search on the position we had just moved into, with the opponent to
+move, filling a shared transposition table for every reply they might choose rather than
+betting on a single prediction. Locally it returned 36% of our own clock at equal depth.
+
+The platform disagrees with its own documentation. The validation log says outright: *"your
+process is suspended while your opponent moves, so anything you compute between your own moves
+does not run."* The rules make the validation log the authority, so pondering is worth nothing
+here and the code was removed rather than left in as decoration. It is in the git history if
+the platform ever stops suspending.
 
 ## Never losing to ourselves
 
@@ -84,12 +91,28 @@ the validation caught it on the first tactical test.
   484 million nodes.
 - `python -m tools.fuzz` — every legal move set, board state and incremental zobrist key checked
   against `python-chess` at every node of thousands of random games.
-- `python -m tools.import_time` — cold import against the 60s init budget, ceiling 40s. Every
+- `python -m tools.import_time` — cold import against the init budget, ceiling 40s. Every
   game pays the numba compile in full: the filesystem is read-only, and `/tmp` starts empty for
   each game, so no compile cache can survive between them.
 
 A move generator that is right in 99.9% of positions still forfeits games, so nothing downstream
 of perft and the fuzzer was built until both were clean.
+
+## What the platform actually reports
+
+Measured in validation on 6 September, on the platform's one dedicated core:
+
+| | Local (4 cores) | Platform (1 core) |
+|---|---|---|
+| cold import | 24.2s | **24.5s / 24.7s** |
+| init budget | assumed 60s | **90s** |
+| node rate | 0.8-1.4 M/s | **1.0-1.5 M/s** |
+| depth per move | 12-18 | 10-14 |
+| slowest move | — | 1.2s against a 1.2s budget |
+
+Two corrections came out of that log. The init budget is 90 seconds, not the 60 the contract
+states, so there is far more compile headroom than this design assumed. And the process is
+suspended between moves, which kills pondering outright.
 
 ## The evaluation weights
 
