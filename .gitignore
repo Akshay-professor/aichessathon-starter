@@ -7,8 +7,3 @@ submission.zip
 .venv-dev/
 snapshots/
 data/
-
-# Tuned evaluation weights, until an arena says they are better than the hand-set numbers.
-# harness/package.py ships weights/ automatically, so an unproven file left here would go out
-# with the next zip. Force-add it (git add -f) at the point it is proven, not before.
-weights/

@@ -91,6 +91,47 @@ the validation caught it on the first tactical test.
 A move generator that is right in 99.9% of positions still forfeits games, so nothing downstream
 of perft and the fuzzer was built until both were clean.
 
+## The evaluation weights
+
+The numbers in `bb_eval.py` are not hand-picked. They are fitted to the results of a million
+positions the engine played against itself, using `tools/tune.py`.
+
+The evaluation is a weighted sum of features interpolated by phase, so it is linear in its own
+weights, which turns tuning into a regression rather than a search: extract each position's
+feature vector, then fit the weights so the score, squashed through a sigmoid, predicts how the
+game ended. The extractor has to mirror `bb_eval.evaluate` exactly or the fit optimises a
+different function from the one that plays, so the tuner refuses to run until a reconstruction
+check passes on 500 random positions.
+
+Measured against the hand-set numbers, identical code otherwise: **62.0% over 100 games
+(+49 =26 -25), about +85 Elo, 2.9 sigma above even.**
+
+What it learned is recognisable chess. The bishop pair went from 30 to 51, toward the 40-50 most
+engines use. A rook on an open file went from 22 to 56. Minor pieces gained slightly in the
+middlegame. Passed pawn bonuses flattened at the far ranks, from 6-120 across ranks to 20-87,
+which is plausible: a pawn on the seventh is already visible to the search and does not need a
+large static bonus.
+
+One failure is worth recording because it looked like success. The first run used an anchor
+regulariser pulling weights back toward the hand-set values at strength 2e-5, while the loss
+gradient on this data is around 1e-5. Equilibrium therefore sat at about half a centipawn of
+movement: the regulariser was as strong as the entire training signal. The loss curve looked
+healthy, validation improved, the weights file was written — and almost nothing had changed.
+Only diffing the actual weights against the defaults exposed it. Sweeping the strength gave a
+textbook curve, and 1e-8 is what ships:
+
+| regularisation | mean weight movement | validation loss |
+|---|---|---|
+| 0 | 30.41 cp | 0.083992 (overfits: train 0.082953) |
+| 1e-8 | 9.95 cp | **0.083915** |
+| 1e-7 | 2.59 cp | 0.083988 |
+| 1e-6 | 0.47 cp | 0.084262 |
+| 2e-5 | ~0 | 0.084378 |
+
+Tuned weights load from `weights/eval.npz` at import, before the evaluation is decorated. That
+ordering matters: numba captures the arrays a jitted function reads as compile-time constants,
+so a load after that point is accepted silently and then ignored.
+
 ## Things that were tried and rejected
 
 **Static exchange evaluation.** Implemented and verified against a brute-force reference over
