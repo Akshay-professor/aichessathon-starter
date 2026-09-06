@@ -18,10 +18,12 @@ from bb_tables import (
     BISHOP,
     BLACK,
     KING,
+    KING_ATTACKS,
     KNIGHT,
     KNIGHT_ATTACKS,
     ONE,
     PAWN,
+    PAWN_ATTACKS,
     QUEEN,
     ROOK,
     U64,
@@ -48,10 +50,20 @@ ISOLATED_PAWN = 2
 ROOK_OPEN_FILE = 3
 ROOK_SEMI_OPEN_FILE = 4
 SHIELD_PAWN = 5
-SCALAR_COUNT = 6
+KING_ZONE_ATTACKS = 6
+KING_FILE_OPEN = 7
+KING_ADJACENT_OPEN = 8
+SCALAR_COUNT = 9
 
-SCALAR_MG = np.array([30, -12, -14, 22, 10, 11], dtype=np.int32)
-SCALAR_EG = np.array([30, -12, -14, 0, 0, 0], dtype=np.int32)
+SCALAR_MG = np.array([30, -12, -14, 22, 10, 11, -3, -20, -8], dtype=np.int32)
+SCALAR_EG = np.array([30, -12, -14, 0, 0, 0, -1, 0, 0], dtype=np.int32)
+
+# King danger by the number of distinct enemy pieces bearing on the king zone. Bucketing the
+# count keeps the response non-linear in attackers - two attackers are far worse than twice one
+# - while the score stays linear in these weights, which is what makes it tunable.
+KING_DANGER_MG = np.array([0, -2, -8, -20, -40, -65, -90, -110], dtype=np.int32)
+KING_DANGER_EG = np.array([0, -1, -3, -7, -12, -18, -25, -30], dtype=np.int32)
+KING_DANGER_BUCKETS = 8
 
 TEMPO = 12
 
@@ -183,6 +195,10 @@ def _passed_masks(color: int) -> NDArray[np.uint64]:
 
 PASSED_MASK: NDArray[np.uint64] = np.stack([_passed_masks(WHITE), _passed_masks(BLACK)])
 
+KING_ZONE: NDArray[np.uint64] = np.array(
+    [KING_ATTACKS[sq] | (ONE << U64(sq)) for sq in range(64)], dtype=U64
+)
+
 # Three files around the king, on the two ranks in front of it, for a cheap shelter term.
 SHIELD_ZONE: NDArray[np.uint64] = np.zeros((2, 64), dtype=U64)
 for _color in (WHITE, BLACK):
@@ -206,6 +222,18 @@ def _load_tuned_weights() -> bool:
     path = Path(__file__).resolve().parent / "weights" / "eval.npz"
     if not path.exists():
         return False
+    # A weights file that does not match the current tables is ignored rather than trusted.
+    # Anything raised here happens at import, and a failed import loses every game, so this
+    # path is deliberately unable to fail.
+    try:
+        return _apply_weights(path)
+    except Exception as error:
+        print(f"ignoring {path.name}: {error!r}")
+        return False
+
+
+def _apply_weights(path: Path) -> bool:
+    applied = False
     with np.load(path) as stored:
         for name, table in (
             ("piece_mg", PIECE_MG), ("piece_eg", PIECE_EG),
@@ -213,10 +241,17 @@ def _load_tuned_weights() -> bool:
             ("mobility_mg", MOBILITY_MG), ("mobility_eg", MOBILITY_EG),
             ("scalar_mg", SCALAR_MG), ("scalar_eg", SCALAR_EG),
             ("passed_mg", PASSED_MG), ("passed_eg", PASSED_EG),
+            ("king_danger_mg", KING_DANGER_MG), ("king_danger_eg", KING_DANGER_EG),
         ):
-            if name in stored:
-                table[...] = stored[name]
-    return True
+            if name not in stored:
+                continue
+            values = stored[name]
+            if values.shape != table.shape:
+                print(f"ignoring {name}: shape {values.shape}, expected {table.shape}")
+                continue
+            table[...] = values
+            applied = True
+    return applied
 
 
 TUNED = _load_tuned_weights()
@@ -229,6 +264,17 @@ def evaluate(bb: NDArray[np.uint64], meta: NDArray[np.int64], ply: int) -> int:
     endgame = 0
     phase = 0
     occupied = bb[ply, WHITE] | bb[ply, BLACK]
+
+    king_square_white = lsb(bb[ply, 1 + KING] & bb[ply, WHITE])
+    king_square_black = lsb(bb[ply, 1 + KING] & bb[ply, BLACK])
+    zone_white = KING_ZONE[king_square_white]
+    zone_black = KING_ZONE[king_square_black]
+    # How many distinct enemy pieces bear on each king, and how many squares of its zone
+    # they cover between them. Accumulated during the piece loop, scored after it.
+    attackers_white = 0
+    attackers_black = 0
+    zone_hits_white = 0
+    zone_hits_black = 0
 
     for color in range(2):
         sign = 1 if color == WHITE else -1
@@ -254,8 +300,22 @@ def evaluate(bb: NDArray[np.uint64], meta: NDArray[np.int64], ply: int) -> int:
                     attacks = rook_attacks(square, occupied)
                 elif piece == QUEEN:
                     attacks = queen_attacks(square, occupied)
+                elif piece == PAWN:
+                    attacks = PAWN_ATTACKS[color][square]
                 else:
                     attacks = ZERO
+
+                if piece != KING:
+                    if color == WHITE:
+                        hits = popcount(attacks & zone_black)
+                        if hits > 0:
+                            attackers_black += 1
+                            zone_hits_black += hits
+                    else:
+                        hits = popcount(attacks & zone_white)
+                        if hits > 0:
+                            attackers_white += 1
+                            zone_hits_white += hits
 
                 if piece >= KNIGHT and piece <= QUEEN:
                     moves = popcount(attacks & ~mine)
@@ -293,6 +353,37 @@ def evaluate(bb: NDArray[np.uint64], meta: NDArray[np.int64], ply: int) -> int:
         if popcount(bb[ply, 1 + BISHOP] & mine) >= 2:
             middlegame += sign * SCALAR_MG[BISHOP_PAIR]
             endgame += sign * SCALAR_EG[BISHOP_PAIR]
+
+    # King danger, applied once per side now that every attacker has been counted.
+    for color in range(2):
+        sign = 1 if color == WHITE else -1
+        own_pawns = bb[ply, 1 + PAWN] & bb[ply, color]
+        if color == WHITE:
+            count = attackers_white
+            hits = zone_hits_white
+            king_square = king_square_white
+        else:
+            count = attackers_black
+            hits = zone_hits_black
+            king_square = king_square_black
+        if count >= KING_DANGER_BUCKETS:
+            count = KING_DANGER_BUCKETS - 1
+        middlegame += sign * KING_DANGER_MG[count]
+        endgame += sign * KING_DANGER_EG[count]
+        middlegame += sign * SCALAR_MG[KING_ZONE_ATTACKS] * hits
+        endgame += sign * SCALAR_EG[KING_ZONE_ATTACKS] * hits
+
+        king_file = king_square & 7
+        if own_pawns & FILE_BB[king_file] == ZERO:
+            middlegame += sign * SCALAR_MG[KING_FILE_OPEN]
+            endgame += sign * SCALAR_EG[KING_FILE_OPEN]
+        adjacent_open = 0
+        if king_file > 0 and own_pawns & FILE_BB[king_file - 1] == ZERO:
+            adjacent_open += 1
+        if king_file < 7 and own_pawns & FILE_BB[king_file + 1] == ZERO:
+            adjacent_open += 1
+        middlegame += sign * SCALAR_MG[KING_ADJACENT_OPEN] * adjacent_open
+        endgame += sign * SCALAR_EG[KING_ADJACENT_OPEN] * adjacent_open
 
     if phase > TOTAL_PHASE:
         phase = TOTAL_PHASE

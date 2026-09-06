@@ -29,6 +29,11 @@ from bb_eval import (
     DOUBLED_PAWN,
     FILE_BB,
     ISOLATED_PAWN,
+    KING_ADJACENT_OPEN,
+    KING_DANGER_BUCKETS,
+    KING_FILE_OPEN,
+    KING_ZONE,
+    KING_ZONE_ATTACKS,
     PASSED_MASK,
     PHASE_WEIGHT,
     ROOK_OPEN_FILE,
@@ -46,6 +51,7 @@ from bb_tables import (
     KNIGHT_ATTACKS,
     ONE,
     PAWN,
+    PAWN_ATTACKS,
     QUEEN,
     ROOK,
     WHITE,
@@ -62,7 +68,8 @@ PST_BASE = 7               # 7 * 64 slots
 MOBILITY_BASE = PST_BASE + 7 * 64
 SCALAR_BASE = MOBILITY_BASE + 7
 PASSED_BASE = SCALAR_BASE + SCALAR_COUNT
-FEATURE_COUNT = PASSED_BASE + 8
+KING_DANGER_BASE = PASSED_BASE + 8
+FEATURE_COUNT = KING_DANGER_BASE + KING_DANGER_BUCKETS
 
 
 @njit("int64(uint64[:, :], int64, int16[:])", cache=False)
@@ -73,6 +80,15 @@ def extract(bb: NDArray[np.uint64], ply: int, out: NDArray[np.int16]) -> int:
 
     phase = 0
     occupied = bb[ply, WHITE] | bb[ply, BLACK]
+
+    king_square_white = lsb(bb[ply, 1 + KING] & bb[ply, WHITE])
+    king_square_black = lsb(bb[ply, 1 + KING] & bb[ply, BLACK])
+    zone_white = KING_ZONE[king_square_white]
+    zone_black = KING_ZONE[king_square_black]
+    attackers_white = 0
+    attackers_black = 0
+    zone_hits_white = 0
+    zone_hits_black = 0
 
     for color in range(2):
         sign = 1 if color == WHITE else -1
@@ -99,8 +115,22 @@ def extract(bb: NDArray[np.uint64], ply: int, out: NDArray[np.int16]) -> int:
                     attacks = rook_attacks(square, occupied)
                 elif piece == QUEEN:
                     attacks = queen_attacks(square, occupied)
+                elif piece == PAWN:
+                    attacks = PAWN_ATTACKS[color][square]
                 else:
                     attacks = ZERO
+
+                if piece != KING:
+                    if color == WHITE:
+                        hits = popcount(attacks & zone_black)
+                        if hits > 0:
+                            attackers_black += 1
+                            zone_hits_black += hits
+                    else:
+                        hits = popcount(attacks & zone_white)
+                        if hits > 0:
+                            attackers_white += 1
+                            zone_hits_white += hits
 
                 if KNIGHT <= piece <= QUEEN:
                     out[MOBILITY_BASE + piece] += sign * popcount(attacks & ~mine)
@@ -131,6 +161,32 @@ def extract(bb: NDArray[np.uint64], ply: int, out: NDArray[np.int16]) -> int:
         if popcount(bb[ply, 1 + BISHOP] & mine) >= 2:
             out[SCALAR_BASE + BISHOP_PAIR] += sign
 
+    for color in range(2):
+        sign = 1 if color == WHITE else -1
+        own_pawns = bb[ply, 1 + PAWN] & bb[ply, color]
+        if color == WHITE:
+            count = attackers_white
+            hits = zone_hits_white
+            king_square = king_square_white
+        else:
+            count = attackers_black
+            hits = zone_hits_black
+            king_square = king_square_black
+        if count >= KING_DANGER_BUCKETS:
+            count = KING_DANGER_BUCKETS - 1
+        out[KING_DANGER_BASE + count] += sign
+        out[SCALAR_BASE + KING_ZONE_ATTACKS] += sign * hits
+
+        king_file = king_square & 7
+        if own_pawns & FILE_BB[king_file] == ZERO:
+            out[SCALAR_BASE + KING_FILE_OPEN] += sign
+        adjacent_open = 0
+        if king_file > 0 and own_pawns & FILE_BB[king_file - 1] == ZERO:
+            adjacent_open += 1
+        if king_file < 7 and own_pawns & FILE_BB[king_file + 1] == ZERO:
+            adjacent_open += 1
+        out[SCALAR_BASE + KING_ADJACENT_OPEN] += sign * adjacent_open
+
     return phase if phase < TOTAL_PHASE else TOTAL_PHASE
 
 
@@ -149,6 +205,8 @@ def current_weights() -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     endgame[SCALAR_BASE : SCALAR_BASE + SCALAR_COUNT] = bb_eval.SCALAR_EG
     middlegame[PASSED_BASE : PASSED_BASE + 8] = bb_eval.PASSED_MG
     endgame[PASSED_BASE : PASSED_BASE + 8] = bb_eval.PASSED_EG
+    middlegame[KING_DANGER_BASE:] = bb_eval.KING_DANGER_MG
+    endgame[KING_DANGER_BASE:] = bb_eval.KING_DANGER_EG
     return middlegame, endgame
 
 
@@ -180,6 +238,8 @@ def save_weights(
         scalar_eg=rounded_eg[SCALAR_BASE : SCALAR_BASE + SCALAR_COUNT],
         passed_mg=rounded_mg[PASSED_BASE : PASSED_BASE + 8],
         passed_eg=rounded_eg[PASSED_BASE : PASSED_BASE + 8],
+        king_danger_mg=rounded_mg[KING_DANGER_BASE:],
+        king_danger_eg=rounded_eg[KING_DANGER_BASE:],
     )
 
 
