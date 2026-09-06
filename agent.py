@@ -26,9 +26,19 @@ import numpy as np
 import bb_board
 import bb_search
 
-PLY_CAP: Final = 300
+# A game still running at 600 plies is drawn. It used to be 300 plies decided on material,
+# which is a different rule with different consequences, so both the cap and the reasoning
+# built on it changed with the 6 September docs.
+PLY_CAP: Final = 600
 INCREMENT_MS: Final = 500.0
 RESERVE_MS: Final = 250.0
+
+# Our own moves still expected. The 600-ply cap is almost never reached, so budgeting against
+# it would starve every move of two thirds of its time; games between engines of this strength
+# from balanced openings run more like 60-90 moves a side. The floor matters more than the
+# start: at the floor the budget settles near the increment, which is sustainable forever.
+EXPECTED_MOVES_START: Final = 55.0
+EXPECTED_MOVES_FLOOR: Final = 20.0
 NODES_PER_CLOCK_CHECK: Final = 2048
 
 MATE: Final = 30_000
@@ -513,11 +523,12 @@ _CALLS = 0
 def _budget_ms(time_left_ms: int, plies_played: int) -> float:
     """Milliseconds to spend on this move.
 
-    Sized against the 300-ply adjudication cap rather than a guessed game length. A game that
-    runs to the cap costs us 150 moves, so the honest average here is about 1.3s, not the 3s
-    that dividing the base clock by 40 suggests.
+    Sized against how long the game is actually likely to last, not against the ply cap. The
+    cap is 600 plies and effectively unreachable, so it is useless as a divisor. The estimate
+    decays with the moves already played and floors out, and the hard ceiling below keeps any
+    single move from eating a dangerous share of what is left.
     """
-    moves_left = max(10.0, (PLY_CAP - plies_played) / 2.0)
+    moves_left = max(EXPECTED_MOVES_FLOOR, EXPECTED_MOVES_START - plies_played / 4.0)
     soft = time_left_ms / moves_left + INCREMENT_MS * 0.75
     hard = max(0.0, time_left_ms - RESERVE_MS) * 0.35
     return max(15.0, min(soft, hard))
@@ -640,10 +651,13 @@ def _commit_move(move: chess.Move) -> None:
 def _contempt(board: chess.Board, plies_played: int) -> int:
     """What a draw is worth to us, in centipawns, from our own point of view.
 
-    Normally zero. Near the ply cap it is not: the referee adjudicates 300 plies on material
-    alone, so if we are ahead a repetition throws away a win the referee would have given us,
-    and if we are behind a repetition rescues half a point from a loss. The evaluation cannot
-    see this, because nothing in the position says the game is about to be scored on material.
+    Normally zero. Close to the 600-ply cap it is not, because the game is simply drawn there
+    whatever the material. Ahead, that throws away a win we were on course for, so draws are
+    worth less than nothing; behind, it rescues half a point, so they are worth taking. The
+    evaluation cannot see either, since nothing in the position says the game is about to end.
+
+    This fires only in the last sixty plies of a six-hundred ply game, so it is rare. It was
+    written when the cap was 300 plies and decided on material, where it mattered far more.
     """
     if PLY_CAP - plies_played > ADJUDICATION_HORIZON:
         return 0
